@@ -23,7 +23,6 @@ import { Events, wa } from '@api/types/wa.types';
 import { AudioConverter, Chatwoot, ConfigService, Database, Openai, S3, WaBusiness } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException } from '@exceptions';
 import { createJid } from '@utils/createJid';
-import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import axios from 'axios';
 import { arrayUnique, isURL } from 'class-validator';
@@ -33,6 +32,8 @@ import mimeTypes from 'mime-types';
 import { join } from 'path';
 
 export class BusinessStartupService extends ChannelStartupService {
+  private static readonly META_REENGAGEMENT_ERROR_CODE = 131047;
+
   constructor(
     public readonly configService: ConfigService,
     public readonly eventEmitter: EventEmitter2,
@@ -207,6 +208,44 @@ export class BusinessStartupService extends ChannelStartupService {
     const phoneNumberId = this.normalizePhoneNumber(received?.metadata?.phone_number_id);
 
     return recipient !== displayPhone && recipient !== phoneNumberId;
+  }
+
+  private normalizeCloudApiStatus(status?: string, errors?: any[]): wa.StatusMessage {
+    if (Array.isArray(errors) && errors.length > 0) {
+      return 'FAILED';
+    }
+
+    switch ((status || '').toLowerCase()) {
+      case 'sent':
+        return 'SENT';
+      case 'delivered':
+        return 'DELIVERED';
+      case 'read':
+        return 'READ';
+      case 'failed':
+        return 'FAILED';
+      default:
+        return 'ACCEPTED';
+    }
+  }
+
+  private getCloudApiErrorDetails(errors?: any[]) {
+    if (!Array.isArray(errors) || errors.length === 0) {
+      return {
+        code: undefined,
+        title: undefined,
+        message: undefined,
+        details: undefined,
+      };
+    }
+
+    const firstError = errors[0];
+    return {
+      code: firstError?.code ? String(firstError.code) : undefined,
+      title: firstError?.title,
+      message: firstError?.message,
+      details: firstError?.error_data?.details,
+    };
   }
 
   private async downloadMediaMessage(message: any) {
@@ -875,6 +914,11 @@ export class BusinessStartupService extends ChannelStartupService {
                 data: message,
               });
 
+              await this.prismaRepository.message.update({
+                where: { id: findMessage.id },
+                data: { status: 'DELETED' },
+              });
+
               if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
                 this.chatwootService.eventWhatsapp(
                   Events.MESSAGES_DELETE,
@@ -886,13 +930,46 @@ export class BusinessStartupService extends ChannelStartupService {
               return;
             }
 
+            const cloudApiErrors =
+              Array.isArray(item?.errors) && item.errors.length > 0
+                ? item.errors
+                : Array.isArray(received?.errors)
+                  ? received.errors
+                  : [];
+            const normalizedStatus = this.normalizeCloudApiStatus(item?.status, cloudApiErrors);
+            const errorDetails = this.getCloudApiErrorDetails(cloudApiErrors);
+            const isWindowClosedError =
+              Number(errorDetails.code) === BusinessStartupService.META_REENGAGEMENT_ERROR_CODE;
+
             const message: any = {
               messageId: findMessage.id,
               keyId: key.id,
               remoteJid: key.remoteJid,
               fromMe: key.fromMe,
               participant: key?.remoteJid,
-              status: item.status.toUpperCase(),
+              status: normalizedStatus,
+              provider: 'META_CLOUD_API',
+              providerStatus: item?.status ? String(item.status).toUpperCase() : undefined,
+              conversationId: item?.conversation?.id,
+              conversationOriginType: item?.conversation?.origin?.type,
+              conversationExpirationTimestamp: item?.conversation?.expiration_timestamp
+                ? Number(item.conversation.expiration_timestamp)
+                : undefined,
+              pricingCategory: item?.pricing?.category,
+              pricingModel: item?.pricing?.pricing_model,
+              pricingBillable: typeof item?.pricing?.billable === 'boolean' ? item.pricing.billable : undefined,
+              errorCode: errorDetails.code,
+              errorTitle: errorDetails.title,
+              errorMessage: errorDetails.message,
+              errorDetails: isWindowClosedError
+                ? 'Conversation window closed (24h). Send a template message to re-engage this user.'
+                : errorDetails.details,
+              providerPayload: {
+                status: item?.status,
+                conversation: item?.conversation,
+                pricing: item?.pricing,
+                errors: cloudApiErrors,
+              },
               instanceId: this.instanceId,
             };
 
@@ -900,6 +977,11 @@ export class BusinessStartupService extends ChannelStartupService {
 
             await this.prismaRepository.messageUpdate.create({
               data: message,
+            });
+
+            await this.prismaRepository.message.update({
+              where: { id: findMessage.id },
+              data: { status: normalizedStatus },
             });
 
             if (findMessage.webhookUrl) {
@@ -1229,19 +1311,25 @@ export class BusinessStartupService extends ChannelStartupService {
         messageTimestamp: (messageSent?.messages[0]?.timestamp as number) || Math.round(new Date().getTime() / 1000),
         instanceId: this.instanceId,
         webhookUrl,
-        status: status[1],
+        status: 'ACCEPTED',
         source: 'unknown',
       };
 
       this.logger.log(messageRaw);
 
-      this.sendDataWebhook(Events.SEND_MESSAGE, messageRaw);
+      const sendMessageEventPayload = {
+        ...messageRaw,
+        final: false,
+        statusDescription: 'Message accepted by Cloud API. Await messages webhook for final delivery status.',
+      };
+
+      this.sendDataWebhook(Events.SEND_MESSAGE, sendMessageEventPayload);
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled && !isIntegration) {
         this.chatwootService.eventWhatsapp(
           Events.SEND_MESSAGE,
           { instanceName: this.instance.name, instanceId: this.instanceId },
-          messageRaw,
+          sendMessageEventPayload,
         );
       }
 
@@ -1249,7 +1337,7 @@ export class BusinessStartupService extends ChannelStartupService {
         await chatbotController.emit({
           instance: { instanceName: this.instance.name, instanceId: this.instanceId },
           remoteJid: messageRaw.key.remoteJid,
-          msg: messageRaw,
+          msg: sendMessageEventPayload,
           pushName: messageRaw.pushName,
         });
 
@@ -1257,7 +1345,7 @@ export class BusinessStartupService extends ChannelStartupService {
         data: messageRaw,
       });
 
-      return messageRaw;
+      return sendMessageEventPayload;
     } catch (error) {
       this.logger.error(error);
       throw new BadRequestException(error.toString());

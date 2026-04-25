@@ -189,6 +189,19 @@ model MessageUpdate {
   participant String?  @db.VarChar(100)
   pollUpdates Json?    @db.Json
   status      String   @db.VarChar(30)
+  provider    String?  @db.VarChar(40)
+  providerStatus                 String?  @db.VarChar(40)
+  conversationId                 String?  @db.VarChar(120)
+  conversationOriginType         String?  @db.VarChar(40)
+  conversationExpirationTimestamp Int?    @db.Int
+  pricingCategory                String?  @db.VarChar(40)
+  pricingModel                   String?  @db.VarChar(40)
+  pricingBillable                Boolean?
+  errorCode                      String?  @db.VarChar(40)
+  errorTitle                     String?  @db.VarChar(255)
+  errorMessage                   String?  @db.VarChar(500)
+  errorDetails                   String?  @db.VarChar(500)
+  providerPayload                Json?    @db.Json
   Message     Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
   messageId   String
   Instance    Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
